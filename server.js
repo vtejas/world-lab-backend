@@ -1,165 +1,275 @@
 // server.js
-require('dotenv').config();
 const express = require('express');
 const multer = require('multer');
 const path = require('path');
 const app = express();
 const cors = require('cors');
 const morgan = require('morgan');
-const fs = require('fs');
-const OpenAI = require('openai');
+const axios = require('axios');
+const fs = require('fs').promises;
+const rateLimit = require('express-rate-limit');
+const helmet = require('helmet');
+const compression = require('compression');
+require('dotenv').config();
 
-// Initialize OpenAI
-const openai = new OpenAI({
-    apiKey: process.env.OPENAI_API_KEY
+// Enhanced security headers
+app.use(helmet());
+
+// Enable CORS with specific origins
+const corsOptions = {
+    origin: process.env.ALLOWED_ORIGINS?.split(',') || '*',
+    methods: ['GET', 'POST'],
+    allowedHeaders: ['Content-Type', 'Authorization'],
+    maxAge: 86400, // 24 hours
+};
+app.use(cors(corsOptions));
+
+// Compress responses
+app.use(compression());
+
+// Custom logging format
+morgan.token('req-body', (req) => JSON.stringify(req.body));
+app.use(morgan(':method :url :status :response-time ms - :req-body'));
+
+app.use(express.json());
+
+// Rate limiting
+const limiter = rateLimit({
+    windowMs: 15 * 60 * 1000, // 15 minutes
+    max: 100, // limit each IP to 100 requests per windowMs
+    message: 'Too many requests from this IP, please try again later.',
+    standardHeaders: true,
+    legacyHeaders: false,
 });
+app.use(limiter);
 
-// Enable CORS
-app.use(cors());
-app.use(morgan('dev'));
-
-// Configure multer for handling file uploads
+// Multer configuration with enhanced validation
 const storage = multer.diskStorage({
-    destination: function (req, file, cb) {
-        cb(null, 'uploads/') // Make sure this directory exists
-    },
-    filename: function (req, file, cb) {
-        // Create unique filename with original extension
-        cb(null, Date.now() + path.extname(file.originalname))
-    }
-});
-
-const upload = multer({ 
-    storage: storage,
-    limits: {
-        fileSize: 5 * 1024 * 1024 // 5MB limit
-    },
-    fileFilter: function (req, file, cb) {
-        // Accept images only
-        if (!file.originalname.match(/\.(jpg|jpeg|png|gif)$/i)) {
-            return cb(new Error('Only image files are allowed!'), false);
-        }
-        cb(null, true);
-    }
-});
-
-// Create uploads directory if it doesn't exist
-if (!fs.existsSync('uploads')) {
-    fs.mkdirSync('uploads');
-}
-
-// Function to encode image to base64
-function encodeImage(imagePath) {
-    const image = fs.readFileSync(imagePath);
-    return image.toString('base64');
-}
-
-// Function to extract JSON from GPT-4 response
-function extractJsonFromResponse(text) {
-    try {
-        // Try to parse the entire response first
-        return JSON.parse(text);
-    } catch (e) {
+    destination: async (req, file, cb) => {
         try {
-            // Remove markdown code blocks if present
-            const jsonStr = text.replace(/```json\n|\n```|```/g, '').trim();
-            return JSON.parse(jsonStr);
-        } catch (e2) {
-            try {
-                // Try to find JSON array in the text
-                const match = text.match(/\[[\s\S]*\]/);
-                if (match) {
-                    return JSON.parse(match[0]);
-                }
-            } catch (e3) {
-                console.error('Failed to parse JSON:', text);
-                // Return a formatted error object that the app can handle
-                return [{
-                    label: "Error parsing objects",
-                    confidence: 0
-                }];
-            }
+            await fs.mkdir('uploads', { recursive: true });
+            cb(null, 'uploads/');
+        } catch (error) {
+            cb(error);
         }
+    },
+    filename: (req, file, cb) => {
+        const uniqueSuffix = `${Date.now()}-${Math.round(Math.random() * 1E9)}`;
+        cb(null, `${file.fieldname}-${uniqueSuffix}${path.extname(file.originalname)}`);
     }
-}
+});
 
-// Function to analyze image using GPT-4-Vision
-async function analyzeImage(imagePath) {
+const fileFilter = (req, file, cb) => {
+    // Log the incoming file details for debugging
+    console.log('File upload attempt:', {
+        originalname: file.originalname,
+        mimetype: file.mimetype,
+        extension: path.extname(file.originalname).toLowerCase()
+    });
+
+    // Define allowed MIME types and extensions
+    const allowedMimeTypes = ['image/jpeg', 'image/jpg', 'image/png', 'image/gif'];
+    const allowedExtensions = ['.jpeg', '.jpg', '.png', '.gif'];
+    
+    const extension = path.extname(file.originalname).toLowerCase();
+    const isValidMimeType = allowedMimeTypes.includes(file.mimetype.toLowerCase());
+    const isValidExtension = allowedExtensions.includes(extension);
+
+    // Log validation results
+    console.log('Validation results:', {
+        isValidMimeType,
+        isValidExtension,
+        providedMimeType: file.mimetype,
+        providedExtension: extension
+    });
+
+    if (isValidMimeType && isValidExtension) {
+        cb(null, true);
+    } else {
+        cb(new Error(`Invalid file type. Received mimetype: ${file.mimetype}, extension: ${extension}. Allowed types: JPEG, PNG and GIF`), false);
+    }
+};
+
+// Configure multer with error handling
+const upload = multer({
+    storage,
+    fileFilter,
+    limits: {
+        fileSize: 10 * 1024 * 1024, // 10MB
+        files: 1
+    }
+}).single('image');
+
+// Wrapper function for better error handling
+const uploadMiddleware = (req, res, next) => {
+    upload(req, res, function(err) {
+        if (err instanceof multer.MulterError) {
+            // A Multer error occurred when uploading
+            console.error('Multer error:', err);
+            return res.status(400).json({
+                status: 'error',
+                error: `Upload error: ${err.message}`,
+                code: 'MULTER_ERROR'
+            });
+        } else if (err) {
+            // An unknown error occurred
+            console.error('Upload error:', err);
+            return res.status(400).json({
+                status: 'error',
+                error: err.message,
+                code: 'UPLOAD_ERROR'
+            });
+        }
+        // Everything went fine
+        next();
+    });
+};
+
+// Helper function to encode image
+const encodeImage = async (filePath) => {
     try {
-        const base64Image = encodeImage(imagePath);
-
-        const response = await openai.chat.completions.create({
-            model: "gpt-4o-mini",
-            messages: [
-                {
-                    role: "user",
-                    content: [
-                        {
-                            type: "text",
-                            text: "List all visible objects in this image. Return ONLY a JSON array of objects with labels and confidence scores. Example format: [{\"label\": \"car\", \"confidence\": 0.95}]. No other text or markdown formatting."
-                        },
-                        {
-                            type: "image_url",
-                            image_url: {
-                                url: `data:image/jpeg;base64,${base64Image}`
-                            }
-                        }
-                    ]
-                }
-            ]
-        });
-
-        console.log('Raw GPT response:', response.choices[0].message.content);
-        
-        // Extract and parse the JSON from the response
-        const detectedObjects = extractJsonFromResponse(response.choices[0].message.content);
-        
-        console.log('Parsed objects:', detectedObjects);
-        
-        return detectedObjects;
-
+        const image = await fs.readFile(filePath);
+        return Buffer.from(image).toString('base64');
     } catch (error) {
-        console.error('Error analyzing image:', error);
-        // Return a formatted error that the app can handle
-        return [{
-            label: `Error: ${error.message}`,
-            confidence: 0
-        }];
+        throw new Error(`Error encoding image: ${error.message}`);
     }
-}
+};
 
-// Handle image upload and analysis
-app.post('/upload', upload.single('image'), async (req, res) => {
+// Helper function to clean up uploaded files
+const cleanupFile = async (filePath) => {
+    try {
+        await fs.unlink(filePath);
+    } catch (error) {
+        console.error('Error cleaning up file:', error);
+    }
+};
+
+// Main analyze endpoint with enhanced error handling
+app.post('/analyze', uploadMiddleware, async (req, res) => {
+    let filePath = null;
+    
     try {
         if (!req.file) {
-            return res.status(400).json({ error: 'No file uploaded' });
+            throw new Error('No image file provided');
         }
         
-        // Analyze the image using GPT-4-Vision
-        const objects = await analyzeImage(req.file.path);
-        
-        // Return the analysis results
+        filePath = req.file.path;
+        const question = req.body.question || "What is in this image?";
+        const base64Image = await encodeImage(filePath);
+
+        // Validate OpenAI API key
+        if (!process.env.OPENAI_API_KEY) {
+            throw new Error('OpenAI API key not configured');
+        }
+
+        // Call OpenAI API with timeout
+        const response = await axios.post(
+            'https://api.openai.com/v1/chat/completions',
+            {
+                model: "gpt-4-vision-preview",
+                messages: [
+                    {
+                        role: "user",
+                        content: [
+                            {
+                                type: "text",
+                                text: question
+                            },
+                            {
+                                type: "image_url",
+                                image_url: {
+                                    url: `data:image/jpeg;base64,${base64Image}`
+                                }
+                            }
+                        ]
+                    }
+                ],
+                max_tokens: 500
+            },
+            {
+                headers: {
+                    'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`,
+                    'Content-Type': 'application/json'
+                },
+                timeout: 30000 // 30 seconds timeout
+            }
+        );
+
         res.json({
-            message: 'File uploaded and analyzed successfully',
-            file: req.file,
-            objects: objects
+            status: 'success',
+            response: response.data.choices[0].message.content,
+            timestamp: new Date().toISOString()
         });
+
     } catch (error) {
-        console.error('Error:', error);
-        res.status(500).json({
-            error: error.message,
-            objects: [{
-                label: `Error: ${error.message}`,
-                confidence: 0
-            }]
-        });
+        console.error('Analysis error:', error);
+        
+        const errorResponse = {
+            status: 'error',
+            error: error.message || 'An error occurred during analysis',
+            timestamp: new Date().toISOString()
+        };
+
+        // Set appropriate status code based on error type
+        if (error.response?.status) {
+            res.status(error.response.status).json(errorResponse);
+        } else if (error.code === 'ECONNABORTED') {
+            res.status(504).json({
+                ...errorResponse,
+                error: 'Request timeout. Please try again.'
+            });
+        } else if (error.message.includes('file type')) {
+            res.status(415).json(errorResponse);
+        } else {
+            res.status(500).json(errorResponse);
+        }
+
+    } finally {
+        // Clean up uploaded file
+        if (filePath) {
+            await cleanupFile(filePath);
+        }
     }
 });
 
-// Serve uploaded files
-app.use('/uploads', express.static('uploads'));
+// Health check endpoint
+app.get('/health', (req, res) => {
+    res.json({
+        status: 'healthy',
+        timestamp: new Date().toISOString(),
+        uptime: process.uptime()
+    });
+});
 
+// Global error handling middleware
+app.use((err, req, res, next) => {
+    console.error('Unhandled error:', err);
+    
+    res.status(err.status || 500).json({
+        status: 'error',
+        error: process.env.NODE_ENV === 'production' 
+            ? 'An unexpected error occurred'
+            : err.message,
+        timestamp: new Date().toISOString()
+    });
+});
+
+// Start server with enhanced error handling
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
+});
+
+// Handle graceful shutdown
+process.on('SIGTERM', () => {
+    console.log('SIGTERM received. Shutting down gracefully...');
+    server.close(() => {
+        console.log('Server closed');
+        process.exit(0);
+    });
+});
+
+// Unhandled rejection handling
+process.on('unhandledRejection', (reason, promise) => {
+    console.error('Unhandled Rejection at:', promise, 'reason:', reason);
 });
