@@ -12,6 +12,9 @@ const helmet = require('helmet');
 const compression = require('compression');
 require('dotenv').config();
 
+// Enable trust proxy - Fix for X-Forwarded-For header
+app.set('trust proxy', 1);
+
 // Enhanced security headers
 app.use(helmet());
 
@@ -60,33 +63,32 @@ const storage = multer.diskStorage({
 });
 
 const fileFilter = (req, file, cb) => {
-    // Log the incoming file details for debugging
-    console.log('File upload attempt:', {
-        originalname: file.originalname,
-        mimetype: file.mimetype,
-        extension: path.extname(file.originalname).toLowerCase()
-    });
+    // Normalize mime type for images
+    const normalizedMimeType = file.mimetype === 'application/octet-stream' 
+        ? `image/${path.extname(file.originalname).toLowerCase().slice(1)}` 
+        : file.mimetype;
 
     // Define allowed MIME types and extensions
     const allowedMimeTypes = ['image/jpeg', 'image/jpg', 'image/png', 'image/gif'];
     const allowedExtensions = ['.jpeg', '.jpg', '.png', '.gif'];
     
     const extension = path.extname(file.originalname).toLowerCase();
-    const isValidMimeType = allowedMimeTypes.includes(file.mimetype.toLowerCase());
+    const isValidMimeType = allowedMimeTypes.includes(normalizedMimeType.toLowerCase());
     const isValidExtension = allowedExtensions.includes(extension);
 
-    // Log validation results
-    console.log('Validation results:', {
+    // Log validation details
+    console.log('File validation:', {
+        originalMimeType: file.mimetype,
+        normalizedMimeType,
+        extension,
         isValidMimeType,
-        isValidExtension,
-        providedMimeType: file.mimetype,
-        providedExtension: extension
+        isValidExtension
     });
 
-    if (isValidMimeType && isValidExtension) {
+    if (isValidMimeType || isValidExtension) {
         cb(null, true);
     } else {
-        cb(new Error(`Invalid file type. Received mimetype: ${file.mimetype}, extension: ${extension}. Allowed types: JPEG, PNG and GIF`), false);
+        cb(new Error(`Invalid file type. Received mimetype: ${normalizedMimeType}, extension: ${extension}. Allowed types: JPEG, PNG and GIF`), false);
     }
 };
 
@@ -139,6 +141,7 @@ const encodeImage = async (filePath) => {
 const cleanupFile = async (filePath) => {
     try {
         await fs.unlink(filePath);
+        console.log('Successfully cleaned up file:', filePath);
     } catch (error) {
         console.error('Error cleaning up file:', error);
     }
@@ -166,7 +169,7 @@ app.post('/analyze', uploadMiddleware, async (req, res) => {
         const response = await axios.post(
             'https://api.openai.com/v1/chat/completions',
             {
-                model: "gpt-4-vision-preview",
+                model: "gpt-4o-mini",
                 messages: [
                     {
                         role: "user",
